@@ -1,0 +1,470 @@
+# Home Assistant automations that support the Predbat GoodWe EMS scripts
+# Paste into automations.yaml (or a package).
+
+  - alias: Export limit watchdog - sell_power
+    description: 'sell_power ignores the GoodWe grid export limit (7.8-8.5 kW seen with a full battery). If the
+      inverter is in sell_power and export stays above 5.5 kW for 30 s: re-run the export script when Predbat is
+      Exporting (it then picks a mode that respects the limit), otherwise set auto.'
+    triggers:
+      - below: -5500
+        entity_id: sensor.grid_power
+        for:
+          seconds: 30
+        trigger: numeric_state
+      - entity_id: select.goodwe_ems_mode
+        for:
+          seconds: 30
+        to: sell_power
+        trigger: state
+    conditions:
+      - condition: state
+        entity_id: select.goodwe_ems_mode
+        state: sell_power
+      - below: -5500
+        condition: numeric_state
+        entity_id: sensor.grid_power
+    actions:
+      - if:
+          - condition: template
+            value_template: "{{ states('predbat.status').startswith('Exporting') }}"
+          - condition: state
+            entity_id: select.predbat_mode
+            state: Control charge & discharge
+          - condition: state
+            entity_id: switch.predbat_set_read_only
+            state: off
+          - condition: state
+            entity_id: input_boolean.ems_test_in_progress
+            state: off
+        then:
+          - action: script.predbat_export
+        else:
+          - action: number.set_value
+            data:
+              value: 10000
+            target:
+              entity_id: number.goodwe_ems_power_limit
+          - action: select.select_option
+            data:
+              option: auto
+            target:
+              entity_id: select.goodwe_ems_mode
+      - action: logbook.log
+        data:
+          entity_id: select.goodwe_ems_mode
+          name: Export limit watchdog
+          message: Export over 5.5 kW in sell_power for 30 s (Predbat {{ states('predbat.status') }}) - 
+            inverter now {{ states('select.goodwe_ems_mode') }}
+    mode: single
+  - alias: Battery taper guard - hold discharge_pv near full
+    description: Near full, once the BMS limits charge current, GoodWe auto hunts and curtails PV for 20-50 
+      min. This holds discharge_pv (battery not charging, surplus exported up to the export limit) while the 
+      BMS limit is low and the surplus is above what the battery can take, and releases to auto when PV falls 
+      back or the battery starts draining.
+    triggers:
+      - below: 15
+        entity_id: sensor.battery_charge_limit
+        id: enter
+        trigger: numeric_state
+      - trigger: state
+        entity_id: predbat.status
+        to: Demand
+        for:
+          seconds: 30
+        id: enter
+      - for:
+          minutes: 5
+        id: exit
+        trigger: template
+        value_template: "{{ states('sensor.pv_power') | float(0) - states('sensor.house_consumption') | float(0)
+          < (states('number.goodwe_grid_export_limit') | float(5400)) - 1400 }}"
+      - at: 15:30:00
+        id: exit_1530
+        trigger: time
+      - trigger: numeric_state
+        entity_id: sensor.grid_power
+        above: 500
+        for:
+          minutes: 1
+        id: exit
+      - trigger: numeric_state
+        entity_id: sensor.battery_power
+        above: 200
+        for:
+          minutes: 2
+        id: exit
+      - trigger: time_pattern
+        minutes: /1
+        id: reenter
+      - trigger: state
+        entity_id: select.goodwe_ems_mode
+        from: discharge_pv
+        id: lost
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id:
+                  - enter
+                  - reenter
+              - condition: state
+                entity_id: select.predbat_mode
+                state: Control charge & discharge
+              - condition: state
+                entity_id: switch.predbat_set_read_only
+                state: off
+              - condition: state
+                entity_id: input_boolean.ems_test_in_progress
+                state: off
+              - condition: state
+                entity_id: select.goodwe_inverter_operation_mode
+                state: general
+              - condition: state
+                entity_id: sensor.grid_mode
+                state: Connected to grid
+              - condition: numeric_state
+                entity_id: sensor.battery_charge_limit
+                below: 15.1
+              - condition: or
+                conditions:
+                  - condition: time
+                    after: 09:00:00
+                    before: 15:30:00
+                  - condition: and
+                    conditions:
+                      - condition: time
+                        after: 15:30:00
+                        before: 17:30:00
+                      - condition: numeric_state
+                        entity_id: sensor.battery_state_of_charge
+                        above: 99.5
+                      - condition: template
+                        value_template: "{{ states('sensor.pv_power') | float(0) - states('sensor.house_consumption')
+                          | float(0) > (states('number.goodwe_grid_export_limit') | float(5400)) + 200 }}"
+              - above: 96.5
+                condition: numeric_state
+                entity_id: sensor.battery_state_of_charge
+              - condition: state
+                entity_id: select.goodwe_ems_mode
+                state: auto
+              - condition: template
+                value_template: "{{ states('predbat.status').startswith('Demand') }}"
+              - "{% set th = (states('number.goodwe_grid_export_limit') | float(5400)) - 900 %}{{ (states('sensor.pv_power')
+                | float(0) - states('sensor.house_consumption') | float(0)) > th or (states('sensor.solcast_pv_forecast_power_now')
+                | float(0) - states('sensor.house_consumption') | float(0)) > th }}"
+              - condition: or
+                conditions:
+                  - condition: state
+                    entity_id: input_boolean.evcc_battery_control
+                    state: off
+                  - condition: state
+                    entity_id: input_select.evcc_battery_mode
+                    state: normal
+              - condition: or
+                conditions:
+                  - condition: not
+                    conditions:
+                      - condition: trigger
+                        id: reenter
+                  - condition: and
+                    conditions:
+                      - condition: state
+                        entity_id: select.goodwe_ems_mode
+                        state: auto
+                        for:
+                          minutes: 3
+                      - condition: numeric_state
+                        entity_id: sensor.battery_power
+                        below: 100
+                      - condition: template
+                        value_template: "{% set pv = states('sensor.pv_power') | float(0) %}{% set house = states('sensor.house_consumption')
+                          | float(0) %}{% set sc = states('sensor.solcast_pv_forecast_power_now') | float(0) %}{%
+                          set th = (states('number.goodwe_grid_export_limit') | float(5400)) - 900 %}{{ pv - house
+                          > 3000 and ([pv, sc * 0.9] | max) - house > th }}"
+            sequence:
+              - action: number.set_value
+                data:
+                  value: 1000
+                target:
+                  entity_id: number.goodwe_ems_power_limit
+              - action: select.select_option
+                data:
+                  option: discharge_pv
+                target:
+                  entity_id: select.goodwe_ems_mode
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.taper_guard_holding
+              - action: logbook.log
+                data:
+                  entity_id: select.goodwe_ems_mode
+                  message: "Hold discharge_pv: BMS charge limit {{ states('sensor.battery_charge_limit') }} A at
+                    {{ states('sensor.battery_state_of_charge') }}%, PV {{ states('sensor.pv_power') }} W, load
+                    {{ states('sensor.house_consumption') }} W"
+                  name: Battery taper guard
+          - conditions:
+              - condition: or
+                conditions:
+                  - condition: trigger
+                    id: exit
+                  - condition: and
+                    conditions:
+                      - condition: trigger
+                        id: exit_1530
+                      - condition: numeric_state
+                        entity_id: sensor.battery_state_of_charge
+                        below: 99
+              - condition: state
+                entity_id: select.goodwe_ems_mode
+                state: discharge_pv
+              - condition: template
+                value_template: "{{ states('predbat.status').startswith('Demand') }}"
+              - condition: state
+                entity_id: input_boolean.taper_guard_holding
+                state: on
+            sequence:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.taper_guard_holding
+              - action: number.set_value
+                data:
+                  value: 10000
+                target:
+                  entity_id: number.goodwe_ems_power_limit
+              - action: select.select_option
+                data:
+                  option: auto
+                target:
+                  entity_id: select.goodwe_ems_mode
+              - action: logbook.log
+                data:
+                  entity_id: select.goodwe_ems_mode
+                  message: Released to auto at {{ states('sensor.battery_state_of_charge') }}%, PV {{ 
+                    states('sensor.pv_power') }} W, load {{ states('sensor.house_consumption') }} W
+                  name: Battery taper guard
+          - conditions:
+              - condition: trigger
+                id: lost
+              - condition: state
+                entity_id: input_boolean.taper_guard_holding
+                state: on
+            sequence:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.taper_guard_holding
+    mode: queued
+    max: 3
+    max_exceeded: silent
+  - alias: Predbat follow-through between cycles
+    description: "Makes the GoodWe do what Predbat intends between its 5-minute cycles. Predbat sends one command
+      per state change, expects the inverter to stop at the target SoC by itself and won't resend an identical command;
+      GoodWe EMS has no target SoC. Rules (first match, every minute): A charge reached target -> hold; B Charging
+      but wrong mode -> predbat_charge; C keep charge Xset current; D freeze/hold -> keep auto vs battery_standby
+      current; E battery export reached target -> stop; F export resumed if SoC back above target; G Freeze exporting
+      -> predbat_freeze_export (3 min settle); H exporting in discharge_pv at the AC ceiling -> re-run export script;
+      I keep sell_power Xset = min(export limit, 10 kW - house - 300); J near-full export: sell_power while the
+      BMS accepts, discharge_pv once it tapers. Never runs while Predbat is mid-cycle, read-only, not in Control
+      charge & discharge, or the inverter isn't in general mode. Needs input_boolean.predbat_guard_held_charge_at_target,
+      input_boolean.predbat_guard_stopped_export_at_target, input_boolean.ems_test_in_progress, input_boolean.demand_export_first_active
+      (rule I) and input_number.predbat_reserve."
+    triggers:
+      - minutes: /1
+        trigger: time_pattern
+      - entity_id: sensor.battery_state_of_charge
+        trigger: state
+    conditions:
+      - condition: state
+        entity_id: select.predbat_mode
+        state: Control charge & discharge
+      - condition: state
+        entity_id: switch.predbat_set_read_only
+        state: off
+      - condition: state
+        entity_id: input_boolean.ems_test_in_progress
+        state: off
+      - condition: state
+        entity_id: select.goodwe_inverter_operation_mode
+        state: general
+      - condition: state
+        entity_id: switch.predbat_active
+        for:
+          seconds: 20
+        state: off
+      - condition: template
+        value_template: "{{ states('sensor.battery_state_of_charge') | is_number and states('sensor.pv_power') |
+          is_number and states('sensor.house_consumption') | is_number and states('sensor.grid_power') | is_number
+          }}"
+    actions:
+      - alias: Read state
+        variables:
+          batt: "{{ states('sensor.battery_power') | float(0) }}"
+          ems: "{{ states('select.goodwe_ems_mode') }}"
+          ems_settled_2min: '{{ now() - states.select.goodwe_ems_mode.last_changed > timedelta(minutes=2) }}'
+          held: "{{ is_state('input_boolean.predbat_guard_held_charge_at_target', 'on') }}"
+          reserve: "{{ states('input_number.predbat_reserve') | float(0) }}"
+          soc: "{{ states('sensor.battery_state_of_charge') | float(0) }}"
+          status: "{{ states('predbat.status') }}"
+          stopped: "{{ is_state('input_boolean.predbat_guard_stopped_export_at_target', 'on') }}"
+          tgt: "{% from 'predbat_control.jinja' import target_pct %}{{ target_pct() | float }}"
+          xset_now: "{{ states('number.goodwe_ems_power_limit') | float(0) }}"
+      - alias: Derived state (needs status from the step above)
+        variables:
+          charging: "{{ status.startswith('Charging') }}"
+          exporting: "{{ status.startswith('Exporting') }}"
+      - alias: Clear our hold flag once Predbat has stopped Charging
+        if:
+          - condition: template
+            value_template: '{{ held and not charging }}'
+        then:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.predbat_guard_held_charge_at_target
+      - alias: Clear our export flag once Predbat has stopped Exporting
+        if:
+          - condition: template
+            value_template: '{{ stopped and not exporting }}'
+        then:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.predbat_guard_stopped_export_at_target
+      - choose:
+          - alias: "A - charge reached Predbat's target: hold"
+            conditions:
+              - condition: template
+                value_template: "{{ charging and tgt > 0 and soc >= tgt and ems in ['charge_battery', 'buy_power',
+                  'auto'] and not held }}"
+            sequence:
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.predbat_guard_held_charge_at_target
+              - action: script.predbat_freeze
+              - action: logbook.log
+                data:
+                  entity_id: select.goodwe_ems_mode
+                  message: Charge reached Predbat target {{ tgt }}% (SoC {{ soc }}%) - holding until Predbat's
+                    next cycle
+                  name: Predbat follow-through
+          - alias: 'B - charging wanted but not in the right mode: resume'
+            conditions:
+              - condition: template
+                value_template: "{% from 'predbat_control.jinja' import charge_mode %}{{ charging and tgt > 0 and
+                  soc < tgt - 1 and ems != charge_mode() and (held or ems_settled_2min) }}"
+            sequence:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.predbat_guard_held_charge_at_target
+              - action: script.predbat_charge
+              - action: logbook.log
+                data:
+                  entity_id: select.goodwe_ems_mode
+                  message: Predbat still Charging to {{ tgt }}% and SoC {{ soc }}% - charge mode set (inverter
+                    was {{ ems }})
+                  name: Predbat follow-through
+          - alias: 'C - charging: keep Xset current'
+            conditions:
+              - condition: template
+                value_template: "{% from 'predbat_control.jinja' import charge_xset, charge_mode %}{{ charging and
+                  ems in ['charge_battery', 'buy_power'] and charge_mode() == ems and ((charge_xset() | float) -
+                  xset_now) | abs >= 300 }}"
+            sequence:
+              - action: script.predbat_charge
+          - alias: 'D - freeze/hold: keep auto vs standby current'
+            conditions:
+              - condition: template
+                value_template: "{% from 'predbat_control.jinja' import freeze_mode %}{% set hold = (not charging
+                  and not exporting and (status.startswith('Freeze charging') or 'Hold for car' in status or 'Hold
+                  for iBoost' in status or (status.startswith('Hold charging') and soc <= reserve))) or (charging
+                  and held and soc >= tgt - 1) %}{% set fm = freeze_mode() %}{{ hold and (ems in ['auto', 'battery_standby']
+                  or (ems == 'discharge_pv' and xset_now == 0)) and (ems != fm or xset_now != (10000 if fm == 'auto'
+                  else 0)) }}"
+            sequence:
+              - action: script.predbat_freeze
+          - alias: 'E - battery-sourced export reached Predbat target: stop'
+            conditions:
+              - condition: template
+                value_template: "{% from 'predbat_control.jinja' import surplus_w %}{{ exporting and tgt >= 0 and
+                  soc < tgt and ems in ['sell_power', 'discharge_pv', 'discharge_battery'] and batt > 500 and (surplus_w()
+                  | int) < 500 }}"
+            sequence:
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.predbat_guard_stopped_export_at_target
+              - action: script.predbat_stop
+              - action: logbook.log
+                data:
+                  entity_id: select.goodwe_ems_mode
+                  message: Export reached Predbat target {{ tgt }}% (SoC {{ soc }}%) - released to auto until 
+                    Predbat's next cycle
+                  name: Predbat follow-through
+          - alias: 'F - we stopped the export but SoC is back above target: resume'
+            conditions:
+              - condition: template
+                value_template: '{{ exporting and stopped and tgt >= 0 and soc > tgt }}'
+            sequence:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.predbat_guard_stopped_export_at_target
+              - action: script.predbat_export
+              - action: logbook.log
+                data:
+                  entity_id: select.goodwe_ems_mode
+                  message: Predbat still Exporting to {{ tgt }}% and SoC {{ soc }}% - export resumed
+                  name: Predbat follow-through
+          - alias: 'G - freeze export: battery must not charge, surplus to grid'
+            conditions:
+              - condition: template
+                value_template: "{% from 'predbat_control.jinja' import freeze_export_mode %}{% set fm = freeze_export_mode()
+                  %}{{ 'Freeze exporting' in status and ems in ['auto', 'discharge_pv', 'battery_standby']
+                  and (ems != fm or xset_now != (10000 if fm == 'auto' else 0)) and (ems == 'battery_standby' or
+                  now() - states.select.goodwe_ems_mode.last_changed > timedelta(minutes=3)) }}"
+            sequence:
+              - action: script.predbat_freeze_export
+          - alias: 'H - exporting in discharge_pv at the AC ceiling: re-run the export script'
+            conditions:
+              - condition: template
+                value_template: "{{ exporting and not stopped and soc < 95 and ems == 'discharge_pv' and batt |
+                  abs <= 300 and (states('sensor.total_power') | float(0)) >= 9500 }}"
+            sequence:
+              - action: script.predbat_export
+              - action: logbook.log
+                data:
+                  entity_id: select.goodwe_ems_mode
+                  name: Predbat follow-through
+                  message: Exporting in discharge_pv at the AC ceiling (AC {{ states('sensor.total_power') }} 
+                    W, house {{ states('sensor.house_consumption') }} W, PV {{ states('sensor.pv_power') }} W)
+                    - export script re-run so the battery can take the overflow; inverter now {{ 
+                    states('select.goodwe_ems_mode') }}
+          - alias: 'I - exporting in sell_power with a stale Xset: update the Xset only'
+            conditions:
+              - condition: template
+                value_template: "{% set want = ([states('number.goodwe_grid_export_limit') | float(5400), 10000
+                  - (states('sensor.house_consumption') | float(0)) - 300] | min / 100) | int * 100 %}{{ exporting
+                  and not stopped and ems == 'sell_power' and is_state('input_boolean.demand_export_first_active',
+                  'off') and want >= 1000 and (xset_now - want) | abs >= 300 }}"
+            sequence:
+              - action: number.set_value
+                target:
+                  entity_id: number.goodwe_ems_power_limit
+                data:
+                  value: "{{ ([states('number.goodwe_grid_export_limit') | float(5400), 10000 - (states('sensor.house_consumption')
+                    | float(0)) - 300] | min / 100) | int * 100 }}"
+          - alias: 'J - exporting near full: sell_power while the BMS still accepts, discharge_pv once it tapers'
+            conditions:
+              - condition: template
+                value_template: "{% set bms = states('sensor.battery_charge_limit') | float(35) %}{% set house =
+                  states('sensor.house_consumption') | float(0) %}{% set pv = states('sensor.pv_power') | float(0)
+                  %}{% set exp = 0 - (states('sensor.grid_power') | float(0)) %}{{ exporting and not stopped and
+                  ((ems == 'auto' and soc >= 95 and soc < 100 and bms > 15 and house <= 8700 and pv - house > 5200
+                  and batt < -1000 and exp < 1000 and not (soc >= 99 and pv >= 9600 and house > 5200)) or (ems ==
+                  'sell_power' and soc >= 95 and bms <= 15)) }}"
+            sequence:
+              - action: script.predbat_export
+              - action: logbook.log
+                data:
+                  entity_id: select.goodwe_ems_mode
+                  name: Predbat follow-through
+                  message: Exporting near full (SoC {{ soc }}%, BMS limit {{ 
+                    states('sensor.battery_charge_limit') }} A, inverter was {{ ems }}) - export script 
+                    re-run; inverter now {{ states('select.goodwe_ems_mode') }}
+    max_exceeded: silent
+    mode: single

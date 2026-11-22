@@ -1,0 +1,319 @@
+# Home Assistant scripts used as Predbat's charge/export/freeze/stop services for a GoodWe ET (EMS mode)
+# Paste into scripts.yaml (or a package). Needs custom_templates/predbat_control.jinja.
+
+predbat_charge:
+  alias: Predbat - force charge
+  description: 'Predbat charge_start_service. Picks auto / buy_power / charge_battery and the Xset from charge_mode()
+    and charge_xset() in custom_templates/predbat_control.jinja: auto when solar covers the charge, buy_power (grid
+    import held at Xset, PV left free) when the grid must top up in daylight, charge_battery only at night. Writes
+    nothing if already in the right mode within 200 W. Order: auto -> Xset -> mode. Also re-run every minute by
+    the follow-through automation while Predbat is Charging.'
+  max: 5
+  mode: queued
+  sequence:
+    - alias: 'Solar covers it: auto (follows the sun instantly)'
+      if:
+        - condition: template
+          value_template: "{{ target_mode == 'auto' }}"
+      then:
+        - if:
+            - condition: state
+              entity_id: select.goodwe_ems_mode
+              state: auto
+            - above: 9999
+              condition: numeric_state
+              entity_id: number.goodwe_ems_power_limit
+          then:
+            - stop: Already in auto
+        - action: number.set_value
+          data:
+            value: 10000
+          target:
+            entity_id: number.goodwe_ems_power_limit
+        - action: select.select_option
+          data:
+            option: auto
+          target:
+            entity_id: select.goodwe_ems_mode
+        - stop: Charging on solar in auto
+    - alias: Already in the right mode at about this Xset - nothing to write
+      if:
+        - condition: template
+          value_template: "{{ is_state('select.goodwe_ems_mode', target_mode) and (states('number.goodwe_ems_power_limit')
+            | float(0) - setpoint | float(0)) | abs < 200 }}"
+      then:
+        - stop: Already in the right mode at this Xset
+    - alias: Clear stale mode state first, unless already in auto or the target mode
+      if:
+        - condition: template
+          value_template: "{{ states('select.goodwe_ems_mode') not in ['auto', target_mode] }}"
+      then:
+        - action: select.select_option
+          data:
+            option: auto
+          target:
+            entity_id: select.goodwe_ems_mode
+        - delay:
+            seconds: 2
+    - action: number.set_value
+      alias: Xset first - this is what makes the setpoint stick
+      data:
+        value: '{{ setpoint | int }}'
+      target:
+        entity_id: number.goodwe_ems_power_limit
+    - action: select.select_option
+      data:
+        option: '{{ target_mode }}'
+      target:
+        entity_id: select.goodwe_ems_mode
+  variables:
+    setpoint: "{% from 'predbat_control.jinja' import charge_xset %}{{ charge_xset() | int }}"
+    target_mode: "{% from 'predbat_control.jinja' import charge_mode %}{{ charge_mode() }}"
+predbat_freeze:
+  alias: Predbat - freeze battery
+  description: 'Predbat charge_freeze_service AND discharge_freeze_service. Freeze/Hold charging: auto with a solar
+    surplus (battery takes it), otherwise battery_standby at Xset 0 (hard hold, house on grid). If predbat.status
+    is Freeze exporting it uses freeze_export_mode() instead. Xset is written before the mode.'
+  max: 5
+  mode: queued
+  sequence:
+    - alias: Already in the right hold state - nothing to write
+      if:
+        - condition: template
+          value_template: "{{ is_state('select.goodwe_ems_mode', target_mode) and (states('number.goodwe_ems_power_limit')
+            | float(-1)) == (target_xset | float) }}"
+      then:
+        - stop: Already in the chosen hold state
+    - action: number.set_value
+      alias: Xset first (0 makes battery_standby a hold, 10000 for auto)
+      data:
+        value: '{{ target_xset | int }}'
+      target:
+        entity_id: number.goodwe_ems_power_limit
+    - action: select.select_option
+      data:
+        option: '{{ target_mode }}'
+      target:
+        entity_id: select.goodwe_ems_mode
+  variables:
+    target_mode: "{% from 'predbat_control.jinja' import freeze_mode, freeze_export_mode %}{{ freeze_export_mode()
+      if 'Freeze exporting' in states('predbat.status') else freeze_mode() }}"
+    target_xset: "{{ 10000 if target_mode == 'auto' else 0 }}"
+predbat_freeze_export:
+  alias: Predbat - freeze export
+  description: 'Freeze exporting: battery must not charge, surplus goes to the grid, battery may still cover the
+    house. discharge_pv at Xset 0 with a solar surplus, auto without. Run every minute by the follow-through automation
+    (rule G) while predbat.status is Freeze exporting, because Predbat itself only sends discharge stop plus charge
+    rate 0.'
+  max: 5
+  mode: queued
+  sequence:
+    - alias: Already in the right state - nothing to write
+      if:
+        - condition: template
+          value_template: "{{ is_state('select.goodwe_ems_mode', target_mode) and (states('number.goodwe_ems_power_limit')
+            | float(-1)) == (target_xset | float) }}"
+      then:
+        - stop: Already in the chosen freeze-export state
+    - action: number.set_value
+      alias: Xset first
+      data:
+        value: '{{ target_xset | int }}'
+      target:
+        entity_id: number.goodwe_ems_power_limit
+    - action: select.select_option
+      data:
+        option: '{{ target_mode }}'
+      target:
+        entity_id: select.goodwe_ems_mode
+  variables:
+    target_mode: "{% from 'predbat_control.jinja' import freeze_export_mode %}{{ freeze_export_mode() }}"
+    target_xset: "{{ 10000 if target_mode == 'auto' else 0 }}"
+predbat_export:
+  alias: Predbat - force export
+  description: "Predbat discharge_start_service (force export). The mode comes from a first-match decision table
+    in target_mode (rules explained inline): night -> discharge_battery at Predbat's rate; daytime -> discharge_pv
+    normally, sell_power when the surplus is above the export cap or PV is at the ~10 kW AC ceiling (DC overflow
+    then charges the battery), auto/discharge_pv near full depending on the BMS charge limit. sell_power does NOT
+    respect the inverter's grid export limit, so its Xset is capped at min(export limit, 10 kW - house - 300 W)
+    and a watchdog automation backs it up. If SoC/PV/house/grid readings are unavailable it releases to auto. Constants
+    are for a GW9.99K-EH (10 kW AC, 5.4 kW export limit, ~5 kW battery discharge)."
+  mode: queued
+  sequence:
+    - alias: Inverter readings unavailable - do not guess, release to auto
+      if:
+        - condition: template
+          value_template: "{{ not (states('sensor.battery_state_of_charge') | is_number and states('sensor.pv_power')
+            | is_number and states('sensor.house_consumption') | is_number and states('sensor.grid_power') | is_number)
+            }}"
+      then:
+        - action: number.set_value
+          data:
+            value: 10000
+          target:
+            entity_id: number.goodwe_ems_power_limit
+        - action: select.select_option
+          data:
+            option: auto
+          target:
+            entity_id: select.goodwe_ems_mode
+        - action: logbook.log
+          data:
+            entity_id: select.goodwe_ems_mode
+            name: Predbat export
+            message: Export call with SoC/PV/house/grid readings unavailable - left in auto rather than acting
+              on defaults
+        - stop: Readings unavailable - inverter left in auto
+    - alias: Clear stale mode state first, unless already in the mode being set
+      if:
+        - condition: template
+          value_template: "{{ states('select.goodwe_ems_mode') != target_mode }}"
+      then:
+        - action: select.select_option
+          data:
+            option: auto
+          target:
+            entity_id: select.goodwe_ems_mode
+        - delay:
+            seconds: 2
+    - alias: Low PV but no export headroom - nothing to do, release to auto
+      if:
+        - condition: template
+          value_template: "{{ target_mode == 'discharge_battery' and xset | int < 200 }}"
+      then:
+        - action: number.set_value
+          data:
+            value: 10000
+          target:
+            entity_id: number.goodwe_ems_power_limit
+        - action: select.select_option
+          data:
+            option: auto
+          target:
+            entity_id: select.goodwe_ems_mode
+        - stop: No export headroom - inverter left in auto
+    - action: number.set_value
+      alias: Xset first - this is what makes the setpoint stick
+      data:
+        value: '{{ xset | int }}'
+      target:
+        entity_id: number.goodwe_ems_power_limit
+    - action: select.select_option
+      alias: sell_power in strong surplus, discharge_pv in daylight, discharge_battery at night
+      data:
+        option: '{{ target_mode }}'
+      target:
+        entity_id: select.goodwe_ems_mode
+  variables:
+    load: "{{ states('sensor.house_consumption') | float(0) }}"
+    pv: "{{ states('sensor.pv_power') | float(0) }}"
+    setpoint: "{% set cap = 5200 %}{% set rate_max = 9600 %}{% set req = states('input_number.predbat_discharge_rate')
+      | float(0) %}{% set headroom = cap - pv + load %}{% set target = headroom if req <= 0 else [req, headroom]
+      | min %}{{ ((([[target, 0] | max, rate_max] | min) / 100) | round(0) | int) * 100 }}"
+    target_mode: "{#- Live inputs (pv and load are script variables). grid_power is + import, battery_power is +
+      discharge. -#}\n{%- set cur = states('select.goodwe_ems_mode') -%}\n{%- set soc = states('sensor.battery_state_of_charge')
+      | float(100) -%}\n{%- set export = 0 - (states('sensor.grid_power') | float(0)) -%}\n{%- set batt = states('sensor.battery_power')
+      | float(0) -%}\n{%- set bms = states('sensor.battery_charge_limit') | float(35) -%}{#- BMS charge-current
+      limit, A -#}\n{%- set solcast = states('sensor.solcast_pv_forecast_power_now') | float(0) -%}{#- PV potential
+      when live PV is already slumped -#}\n{#- Thresholds (W, %) -#}\n{%- set NIGHT_PV = 1000 -%}{#- below this,
+      discharge_battery (night/dusk) -#}\n{%- set PV_CEILING = 9600 -%}{#- PV reading at the inverter AC ceiling
+      -#}\n{%- set AC_MAX = 10000 -%}{#- inverter AC output limit -#}\n{%- set CAP_EXPORT = 4800 -%}{#- export this
+      high = at the 5.4 kW export cap -#}\n{%- set OVER_LIMIT = 5700 -%}{#- sell_power overshooting the export limit
+      (instantaneous; raised from 5500 on 8 Nov when Xset went to the full limit - sustained overshoot is the 30
+      s watchdog's job) -#}\n{%- set HIGH_SOC = 95 -%}\n{%- set AC_SELL_SOC_MAX = 99 -%}{#- 2b allowed up to here:
+      with the AC output already near the ceiling, export cannot exceed 10 kW - house < 4.8 kW, so the full-battery
+      sell_power overshoot (28 Sep) cannot happen -#}\n{%- set TAPER_LIMIT = 15 -%}{#- BMS limit (A) at which auto
+      starts hunting and curtailing PV -#}\n{%- set CAP_SURPLUS = 5200 -%}{#- PV - load above the export cap -#}\n\
+      {%- set SELL_SURPLUS = 6200 -%}{#- cap + 1 kW margin -#}\n{%- set BATT_IDLE = 300 -%}\n{%- set BATT_CHARGING
+      = -200 -%}\n{%- set AC_HEADROOM_MIN = 1300 -%}{#- AC output left for export (Xset >= 1000 after the 300 W
+      margin) -#}\n{%- set IMPORT_MAX = 300 -%}{#- import in sell_power = AC output not filling as expected -#}\n\
+      {#- PV curtailed to house + cap (or AC ceiling) in a mode that never charges: live PV hides the real surplus
+      -#}\n{%- set ac_out = states('sensor.total_power') | float(0) -%}{#- inverter AC output, W -#}\n{%- set AC_FULL
+      = 9500 -%}{#- AC output this high = at the ~10 kW ceiling (8 Nov 2026) -#}\n{%- set ac_full = cur == 'discharge_pv'
+      and batt | abs <= BATT_IDLE and ac_out >= AC_FULL -%}{#- discharge_pv cannot charge, so at the AC ceiling
+      it curtails PV below 9.6 kW and hides the real surplus (7 Nov 11:30-12:00) -#}\n{%- set clipped = cur in ['discharge_pv',
+      'battery_standby'] and batt | abs <= BATT_IDLE and (export >= CAP_EXPORT or pv >= PV_CEILING or ac_full) -%}\n\
+      {#- PV at the AC ceiling and house load too high for the export target to fit under it: battery cannot add
+      export. True from discharge_pv (PV held ~10.3 kW) and from auto (PV honest, battery charging), so no flip-flop.
+      -#}\n{%- set ac_bound = (pv >= PV_CEILING or ac_full) and batt <= BATT_IDLE and (load + CAP_EXPORT) > AC_MAX
+      -%}\n{#- 17 Nov 2026: AC output discharge_pv would ask for = PV + its Xset (battery discharge, at most ~5
+      kW), capped at house + export limit. Above 9.7 kW (the same 10 kW - 300 W target sell_power uses) the AC output
+      pins at ~9.95 kW, PV is curtailed and the battery still drains 0.3-1.3 kW (EMS retest D1 cells 3, 5, 6, 16
+      Nov). The ac_full/ac_bound tests miss this because the battery is discharging, not idle. -#}\n{%- set AC_TARGET
+      = 9700 -%}\n{%- set BATT_DIS_MAX = 5000 -%}\n{%- set lim = states('number.goodwe_grid_export_limit') | float(5400)
+      -%}\n{%- set ac_tight = ([pv + ([[setpoint | int, 1000] | max, BATT_DIS_MAX] | min), load + lim] | min) >
+      AC_TARGET -%}\n{#- Decision table: first match wins -#}\n{%- set rules = [\n  [pv < NIGHT_PV and solcast <
+      NIGHT_PV, 'discharge_battery'],\n  [soc >= HIGH_SOC and bms <= TAPER_LIMIT and (clipped or pv - load > CAP_SURPLUS
+      or solcast - load > CAP_SURPLUS), 'discharge_pv'],\n  [cur == 'sell_power' and export < 0 - IMPORT_MAX, 'auto'],\n\
+      \  [ac_bound and soc < AC_SELL_SOC_MAX and load <= AC_MAX - AC_HEADROOM_MIN, 'sell_power'],\n  [ac_bound,
+      'auto'],\n  [soc >= HIGH_SOC and bms > TAPER_LIMIT and (clipped or pv - load > CAP_SURPLUS) and load <= AC_MAX
+      - AC_HEADROOM_MIN, 'sell_power'],\n  [soc >= HIGH_SOC and (clipped or pv - load > CAP_SURPLUS), 'auto'],\n\
+      \  [soc >= HIGH_SOC and ac_tight and load <= AC_MAX - AC_HEADROOM_MIN, 'sell_power'],\n  [soc >= HIGH_SOC
+      and ac_tight, 'auto'],\n  [soc >= HIGH_SOC, 'discharge_pv'],\n  [cur == 'sell_power' and export > OVER_LIMIT,
+      'auto'],\n  [cur == 'sell_power' and batt < BATT_CHARGING, 'sell_power'],\n  [clipped or pv - load > SELL_SURPLUS,
+      'sell_power'],\n  [ac_tight and load <= AC_MAX - AC_HEADROOM_MIN, 'sell_power'],\n  [ac_tight, 'auto'],\n\
+      \  [true, 'discharge_pv']\n] -%}\n{#- 1 night: discharge_battery, setpoint-accurate, only used when PV is
+      negligible AND Solcast also says no sun (it throttles PV; 22 Oct an inverter output stop in full sun read
+      PV 0.64 kW, the old PV-only test chose discharge_battery 9.6 kW, and when output returned the battery exported
+      4.3-5.2 kW for 3 min with PV held at 3.4 kW). Low live PV with Solcast >= 1 kW now falls through to the daytime
+      rules.\n    1b BMS taper (>=95%, limit <=15 A) with surplus above cap, by live PV or Solcast: discharge_pv,
+      PV held at house + cap (auto hunts and curtails PV 20-50 min: 5-9 Oct).\n    2a sell_power importing: auto
+      (safety for 2b).\n    2b AC ceiling with house load leaving >= 1.3 kW of AC output: sell_power, Xset = 10
+      kW - house - 300 W, so export fills the AC output and the DC excess still charges the battery (auto exported
+      nothing and charged 5-6 kW on 12 Oct 10:30-11:40; live tests 13 Oct 14 s and 63 s: export 3.1-4.7 kW, battery
+      still charging 1.3-4.4 kW, PV unchanged, no import).\n    2 AC ceiling, house too high for useful export or
+      SOC >= 95: auto, excess DC goes to the battery (4 Oct 12:12-13:00 sell_power curtailed ~2 kWh; 6 Oct 10:30-11:10
+      the old PV+battery test flip-flopped auto/discharge_pv).\n    3a (8 Nov 2026) high SOC, BMS still accepting
+      (limit > 15 A), surplus above cap, house leaving AC room: sell_power - export at the limit and the overflow
+      into the battery, as Predbat models an export window. Before this, 95-99% with surplus went to auto, which
+      exported nothing and charged the battery at 7 kW while Predbat was exporting to 91% (8 Nov 13:51-14:05).\n\
+      \    3 high SOC + surplus above cap (BMS tapering or no AC room): auto, fills the last % and respects the
+      export limit (sell_power exported 8.5 kW full on 28 Sep).\n    4 high SOC, modest PV: discharge_pv, battery
+      tops up export.\n    5 sell_power over the limit: auto.\n    6 sell_power with battery absorbing surplus:
+      stay (stops sell/discharge_pv flip-flop).\n    7 curtailed or surplus clearly above cap: sell_power, exports
+      at cap, rest to battery (28 Sep trap ~3 kWh).\n    4a/7a (17 Nov 2026) where 4 or 8 would pick discharge_pv
+      but it would ask for more than 9.7 kW of AC output (ac_tight): sell_power with Xset = min(export limit, 10
+      kW - house - 300 W) if the house leaves >= 1.3 kW of AC room, otherwise auto. Same export, but the DC overflow
+      charges the battery instead of being curtailed, and no follow-through re-run is needed.\n    8 otherwise:
+      discharge_pv, PV first to the cap, battery tops up to Xset. -#}\n{%- set ns = namespace(mode='') -%}\n{%-
+      for r in rules if r[0] and ns.mode == '' -%}{%- set ns.mode = r[1] -%}{%- endfor -%}\n{{- ns.mode -}}"
+    xset: "{% if target_mode == 'sell_power' %}{% set lim = states('number.goodwe_grid_export_limit') | float(5400)
+      %}{{ (([[10000 - load - 300, lim] | min, 1000] | max) / 100) | int * 100 }}{% elif target_mode == 'auto' %}10000{%
+      elif target_mode == 'discharge_pv' %}{{ [setpoint | int, 1000] | max }}{% else %}{{ setpoint | int }}{% endif
+      %}"
+  max: 5
+predbat_stop:
+  alias: Predbat - release to auto
+  description: "Predbat charge_stop_service and discharge_stop_service: release to auto with Xset 10000. The first
+    block yields to a separate curtailment automation on my system - delete it if you don't have one. mode queued
+    because charge_stop and discharge_stop arrive together."
+  mode: queued
+  sequence:
+    - if:
+        - condition: or
+          conditions:
+            - condition: state
+              entity_id: select.goodwe_ems_mode
+              state: battery_standby
+            - condition: state
+              entity_id: select.goodwe_ems_mode
+              state: charge_battery
+        - condition: state
+          entity_id: automation.pv_curtailment_hold_battery_charge
+          state: on
+        - after: 07:00:00
+          before: 15:00:00
+          condition: time
+      then:
+        - stop: Curtailment automation active - not overwriting EMS mode
+    - action: number.set_value
+      data:
+        value: 10000
+      target:
+        entity_id: number.goodwe_ems_power_limit
+    - action: select.select_option
+      data:
+        option: auto
+      target:
+        entity_id: select.goodwe_ems_mode
+  max: 5

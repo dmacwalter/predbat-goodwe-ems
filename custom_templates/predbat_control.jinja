@@ -1,0 +1,233 @@
+{#-
+  custom_templates/predbat_control.jinja
+  Shared decision macros for the Predbat GoodWe EMS scripts and the follow-through automation,
+  so the scripts and the between-cycle checks can never disagree.
+
+  Site-specific values to change: battery capacity 22.4 (kWh) appears in late_fill_ok(), solar_margin_kwh(),
+  charge_pace_w() and charge_xset(); 960 = 16:00 (my "battery full by 16:00" rule before a 16:00-21:00 peak
+  tariff); rate_max 9600 W. The evcc / car entities are optional - if you don't have them the tests just read
+  off/0. Solcast (sensor.solcast_pv_forecast_*) and Predbat's predbat.load_energy are used for the solar
+  forecast; sensor.pv_surplus_kw_smoothed, sensor.home_goodwe_pv_power_mean_15_min and
+  sensor.house_consumption_30min_average are my own helper sensors (smoothed/averaged PV, surplus and house load).
+
+  What Predbat means by each state:
+  - Charging: charge to the target SoC; PV first, grid tops up.
+  - Freeze charging / Hold charging / Hold for car / Hold for iBoost: battery must not discharge, solar may charge it.
+  - Exporting: discharge to the target SoC at the export rate.
+  - Freeze exporting: battery must not charge (Predbat sets charge rate 0 and calls discharge stop), surplus to grid.
+-#}
+
+{#- Solar surplus (W). 0 when PV is negligible (house_consumption reads wrongly while grid-charging). -#}
+{% macro surplus_w() -%}
+{%- set pv = states('sensor.pv_power') | float(0) -%}
+{%- set load = states('sensor.house_consumption') | float(0) -%}
+{{- (([pv - load, 0] | max) if pv >= 300 else 0) | round(0) | int -}}
+{%- endmacro %}
+
+{#- Solar surplus for the battery while Charging, with the car's charging taken out of the house load so the
+    battery gets the solar first (optional evcc entities). -#}
+{% macro battery_surplus_w() -%}
+{%- if is_state('input_boolean.car_may_share_battery_solar', 'on') -%}{{- surplus_w() -}}
+{%- else -%}
+{%- set pv = states('sensor.pv_power') | float(0) -%}
+{%- set load = states('sensor.house_consumption') | float(0) -%}
+{%- set car = 0 if is_state('switch.evcc_goodwe_charger_ha_battery_boost', 'on') else [(states('sensor.evcc_goodwe_charger_ha_charge_power') | float(0)) * 1000, 0] | max -%}
+{{- (([pv - [load - car, 0] | max, 0] | max) if pv >= 300 else 0) | round(0) | int -}}
+{%- endif -%}
+{%- endmacro %}
+
+{#- Predbat's current target SoC (%) from the predbat.status 'detail' attribute ("target 90%-93%" while
+    charging/exporting, "target 90%" while freezing). Last number wins; -1 if none. -#}
+{% macro target_pct() -%}
+{%- set m = (state_attr('predbat.status', 'detail') or '') | regex_findall('([0-9]+(?:\\.[0-9]+)?)%') -%}
+{{- (m | last | float) if m | count > 0 else -1 -}}
+{%- endmacro %}
+
+{#- End (minutes after local midnight) of the Predbat charge window containing now, from best_charge_window in
+    the predbat.status 'debug' attribute; back-to-back windows at the same or cheaper rate are treated as one
+    stretch (Predbat often splits one cheap period into short windows). -1 if none. -#}
+{% macro charge_window_end() -%}
+{%- set dbg = state_attr('predbat.status', 'debug') or '' -%}
+{%- set part = (dbg.split('best_charge_window=')[1] if 'best_charge_window=' in dbg else '').split(']')[0] -%}
+{%- set wins = part | regex_findall("'start': ([0-9]+), 'end': ([0-9]+), 'average': ([0-9.]+)") -%}
+{%- set n = now().hour * 60 + now().minute -%}
+{%- set ns = namespace(e=-1, r=0) -%}
+{%- for w in wins -%}
+{%- if ns.e < 0 -%}
+{%- if (w[0] | int) <= n + 5 and (w[1] | int) > n -%}{%- set ns.e = w[1] | int -%}{%- set ns.r = w[2] | float -%}{%- endif -%}
+{%- elif (w[0] | int) <= ns.e + 5 and (w[2] | float) <= ns.r + 0.01 -%}{%- set ns.e = [ns.e, w[1] | int] | max -%}
+{%- endif -%}
+{%- endfor -%}
+{{- ns.e -}}
+{%- endmacro %}
+
+{#- Live solar factor: 15-min mean PV over Solcast power_now, limited to 1.0-1.5 (only ever scales the forecast up);
+    1.0 when Solcast says under 500 W. -#}
+{% macro solar_factor() -%}
+{%- set sc = states('sensor.solcast_pv_forecast_power_now') | float(0) -%}
+{%- set pv15 = states('sensor.home_goodwe_pv_power_mean_15_min') | float(0) -%}
+{{- (([[pv15 / sc, 1] | max, 1.5] | min) | round(2)) if sc >= 500 else 1 -}}
+{%- endmacro %}
+
+{#- Spare solar (kWh) from now to wend (minutes after midnight): (Solcast p50 x solar_factor - Predbat load
+    forecast) x 0.9, floored at 0. live=false leaves out the live factor; cap_actual=true counts the house load as
+    the lower of Predbat's forecast and the actual 30-min average. -1 when it can't be worked out. -#}
+{% macro solar_spare_kwh(wend, live=true, cap_actual=false) -%}
+{%- set t = now() -%}
+{%- set fc = state_attr('sensor.solcast_pv_forecast_forecast_today', 'detailedForecast') or [] -%}
+{%- set lr = state_attr('predbat.load_energy', 'results') or {} -%}
+{%- if (wend | int) <= 0 or fc | count == 0 or (states('sensor.solcast_pv_forecast_power_now') | float(0)) < 500 -%}-1
+{%- else -%}
+{%- set f = (solar_factor() | float(1)) if live else 1 -%}
+{%- set wt = today_at('00:00') + timedelta(minutes=wend | int) -%}
+{%- set ns = namespace(pv=0) -%}
+{%- for p in fc -%}
+{%- set s = p.period_start -%}
+{%- set a = [s, t] | max -%}
+{%- set b = [s + timedelta(minutes=30), wt] | min -%}
+{%- if b > a -%}{%- set ns.pv = ns.pv + p.pv_estimate * (b - a).total_seconds() / 3600 -%}{%- endif -%}
+{%- endfor -%}
+{%- set k0 = (t - timedelta(minutes=t.minute % 5)).strftime('%Y-%m-%dT%H:%M:00%z') -%}
+{%- set k1 = wt.strftime('%Y-%m-%dT%H:%M:00%z') -%}
+{%- set act = states('sensor.house_consumption_30min_average') | float(-1) -%}
+{%- set act_kwh = (act / 1000 * ([(wt - t).total_seconds(), 0] | max) / 3600) if (cap_actual and act > 0) else 999 -%}
+{%- if k0 in lr and k1 in lr -%}{{- ([ns.pv * f - ([lr[k1] - lr[k0], act_kwh] | min), 0] | max * 0.9) | round(3) -}}
+{%- else -%}-1
+{%- endif -%}
+{%- endif -%}
+{%- endmacro %}
+
+{#- Most the battery is forecast to gain from solar 16:00-18:30 (Solcast p50 x 0.8 minus Predbat load, highest
+    running total, x 0.9). -1 when it can't be worked out. -#}
+{% macro solar_late_kwh() -%}
+{%- set fc = state_attr('sensor.solcast_pv_forecast_forecast_today', 'detailedForecast') or [] -%}
+{%- set lr = state_attr('predbat.load_energy', 'results') or {} -%}
+{%- set ns = namespace(cum=0, peak=0, ok=true) -%}
+{%- for m in range(960, 1110, 30) -%}
+{%- set s = today_at('00:00') + timedelta(minutes=m) -%}
+{%- set e = s + timedelta(minutes=30) -%}
+{%- set ks = s.strftime('%Y-%m-%dT%H:%M:00%z') -%}
+{%- set ke = e.strftime('%Y-%m-%dT%H:%M:00%z') -%}
+{%- set p = (fc | selectattr('period_start', 'eq', s) | list | first) if fc | count > 0 else none -%}
+{%- if p is none or ks not in lr or ke not in lr -%}{%- set ns.ok = false -%}
+{%- else -%}
+{%- set ns.cum = ns.cum + p.pv_estimate * 0.5 * 0.8 - (lr[ke] - lr[ks]) -%}
+{%- set ns.peak = [ns.peak, ns.cum] | max -%}
+{%- endif -%}
+{%- endfor -%}
+{{- ((ns.peak * 0.9) | round(3)) if ns.ok else -1 -}}
+{%- endmacro %}
+
+{#- 'yes' when, before 16:00, spare solar to 16:00 plus the late top-up covers the energy still needed for 100%
+    with 1 kWh to spare - then no grid is bought for the 16:00 target. -#}
+{% macro late_fill_ok() -%}
+{%- set a = solar_spare_kwh(960) | float(-1) -%}
+{%- set b = solar_late_kwh() | float(-1) -%}
+{%- set soc = states('sensor.battery_state_of_charge') | float(0) -%}
+{%- set need = ([100 - soc, 0] | max) / 100 * 22.4 / 0.95 -%}
+{{- 'yes' if (now().hour < 16 and a >= 0 and b >= 0 and a + b >= need + 1.0) else 'no' -}}
+{%- endmacro %}
+
+{#- Spare solar to 16:00 minus the energy still needed for 100% (kWh). -99 when it can't be worked out or from 15:30. -#}
+{% macro solar_margin_kwh(live=true) -%}
+{%- set spare = solar_spare_kwh(960, live) | float(-1) -%}
+{%- set soc = states('sensor.battery_state_of_charge') | float(0) -%}
+{%- set need = ([100 - soc, 0] | max) / 100 * 22.4 / 0.95 -%}
+{{- ((spare - need) | round(2)) if (spare >= 0 and now().strftime('%H:%M') < '15:30') else -99 -}}
+{%- endmacro %}
+
+{#- Grid pace (W) while Charging in daylight: the grid rate still needed to reach Predbat's target by the end of
+    its window after counting spare solar. 0 = no grid needed (solar covers it, late solar will finish it, within
+    1% at 98%+, or the BMS is tapering below 20 A). -1 = can't be worked out (night, no forecast/target/window).
+    Minutes left floored at 15; capped at Predbat's requested rate. -#}
+{% macro charge_pace_w() -%}
+{%- set rate_max = 9600 -%}
+{%- set req = states('input_number.predbat_charge_rate') | float(0) -%}
+{%- set rate = rate_max if req <= 0 else [req, rate_max] | min -%}
+{%- set soc = states('sensor.battery_state_of_charge') | float(0) -%}
+{%- set tgt = target_pct() | float -%}
+{%- set wend = charge_window_end() | int -%}
+{%- set left = wend - (now().hour * 60 + now().minute) - 5 -%}
+{%- set day = (states('sensor.solcast_pv_forecast_power_now') | float(0)) >= 500 -%}
+{%- set solar = solar_spare_kwh(wend, true, true) | float(-1) -%}
+{%- if day and tgt > soc and wend > 0 and left <= 0 -%}0
+{%- elif tgt > soc and wend > 0 and left > 0 and solar >= 0 -%}
+{%- if (soc >= 98 and tgt - soc <= 1) or (states('sensor.battery_charge_limit') | float(35)) < 20 or late_fill_ok() == 'yes' -%}0
+{%- else -%}
+{%- set kwh = (tgt - soc) / 100 * 22.4 / 0.95 -%}
+{%- set grid_kwh = kwh - solar -%}
+{%- if grid_kwh <= 0 -%}0
+{%- else -%}{{- ([grid_kwh / ([left, 15] | max / 60) * 1000 * 1.2, rate] | min) | round(0) | int -}}
+{%- endif -%}
+{%- endif -%}
+{%- else -%}-1
+{%- endif -%}
+{%- endmacro %}
+
+{#- EMS mode while Predbat is Charging. auto when no grid is needed or the smoothed solar surplus already covers
+    the grid pace (enter at pace + 300 W, stay above pace - 300 W); buy_power (grid import held at Xset, PV free)
+    when the grid has to top up; pace unknown -> auto in daylight, charge_battery only at night.
+    charge_battery is not used in daylight: with a fixed Xset the grid fills every cloud dip, and near full it
+    curtailed PV while importing. -#}
+{% macro charge_mode() -%}
+{%- set g = charge_pace_w() | float(-1) -%}
+{%- set day = (states('sensor.solcast_pv_forecast_power_now') | float(0)) >= 500 -%}
+{%- if g < 0 -%}{{- 'auto' if day else 'charge_battery' -}}
+{%- elif g == 0 -%}auto
+{%- else -%}
+{%- set s = (states('sensor.pv_surplus_kw_smoothed') | float(0)) * 1000 -%}
+{%- set cur = states('select.goodwe_ems_mode') -%}
+{{- 'auto' if s >= ((g - 300) if cur == 'auto' else (g + 300)) else 'buy_power' -}}
+{%- endif -%}
+{%- endmacro %}
+
+{#- Xset (W) while Charging: buy_power -> the grid pace (min 500 W); charge_battery (night/fallback) -> the rate
+    needed to reach the target by the window end (x1.2, never above Predbat's rate) or all of the current solar
+    surplus, whichever is higher; Predbat's full rate when the target/window can't be read or SoC >= 95%. -#}
+{% macro charge_xset() -%}
+{%- set rate_max = 9600 -%}
+{%- set req = states('input_number.predbat_charge_rate') | float(0) -%}
+{%- set rate = rate_max if req <= 0 else [req, rate_max] | min -%}
+{%- set soc = states('sensor.battery_state_of_charge') | float(0) -%}
+{%- set tgt = target_pct() | float -%}
+{%- set wend = charge_window_end() | int -%}
+{%- set left = wend - (now().hour * 60 + now().minute) - 5 -%}
+{%- set surplus = [battery_surplus_w() | float, 10000] | min -%}
+{%- set g = charge_pace_w() | float(-1) -%}
+{%- if g >= 0 -%}
+{%- set x = [g, 500] | max -%}
+{%- else -%}
+{%- if tgt <= 0 or wend < 0 or left <= 0 or soc >= 95 or tgt <= soc -%}
+{%- set need = rate -%}
+{%- else -%}
+{%- set kwh = (tgt - soc) / 100 * 22.4 / 0.95 -%}
+{%- set need = [[kwh / (left / 60) * 1000 * 1.2, 400] | max, rate] | min -%}
+{%- endif -%}
+{%- set x = [need, surplus] | max -%}
+{%- endif -%}
+{{- ((x / 100) | round(0, 'ceil') | int) * 100 -}}
+{%- endmacro %}
+
+{#- EMS mode for a freeze/hold: auto with a solar surplus (enter > 500 W, stay > 200 W), otherwise battery_standby
+    at Xset 0 (hard hold). Never use battery_standby 0 with a surplus near full - it curtailed PV to the house load. -#}
+{% macro freeze_mode() -%}
+{%- if is_state('switch.evcc_goodwe_charger_ha_battery_boost', 'on') -%}auto
+{%- elif (surplus_w() | int) > (200 if is_state('select.goodwe_ems_mode', 'auto') else 500) -%}auto
+{%- else -%}battery_standby
+{%- endif -%}
+{%- endmacro %}
+
+{#- EMS mode for Freeze exporting: discharge_pv at Xset 0 with a solar surplus (battery held, surplus exported),
+    auto without. Always auto at SoC >= 95% (discharge_pv 0 near full curtailed PV on older firmware), and only
+    exports the surplus while our own forecast says the battery will still fill from solar (solar_margin_kwh()
+    >= 1 kWh to enter, >= 0 to stay). -#}
+{% macro freeze_export_mode() -%}
+{%- set m = solar_margin_kwh() | float(-99) -%}
+{%- set cur = states('select.goodwe_ems_mode') -%}
+{%- if is_state('switch.evcc_goodwe_charger_ha_battery_boost', 'on') -%}auto
+{%- elif (states('sensor.battery_state_of_charge') | float(0)) >= 95 -%}auto
+{%- elif m < (0 if cur == 'discharge_pv' else 1.0) -%}auto
+{%- elif (surplus_w() | int) > (200 if cur == 'discharge_pv' else 500) -%}discharge_pv
+{%- else -%}auto
+{%- endif -%}
+{%- endmacro %}
