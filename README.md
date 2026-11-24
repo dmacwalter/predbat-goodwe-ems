@@ -19,11 +19,12 @@ They have been in daily use since September 2026. Treat them as a working refere
   charge_freeze_service: script.predbat_freeze
   charge_stop_service: script.predbat_stop
   discharge_start_service: script.predbat_export
-  discharge_freeze_service: script.predbat_freeze    # the script checks predbat.status for Freeze exporting
+  discharge_freeze_service: script.predbat_freeze_export
+  # predbat_freeze also checks predbat.status, so a Freeze exporting call that lands on it is handled too
   discharge_stop_service: script.predbat_stop
 ```
 
-Use whichever service format your Predbat version expects; the [docs](https://springfall2008.github.io/batpred/apps-yaml/#service-api) show the `service:` / `entity_id:` form. Predbat's charge and discharge rates are written to `input_number.predbat_charge_rate` and `input_number.predbat_discharge_rate`, and the scripts read them from there. The reserve is written to `input_number.predbat_reserve`. Turn on `switch.predbat_set_export_freeze` if you want Freeze exporting.
+Use whichever service format your Predbat version expects; the [docs](https://springfall2008.github.io/batpred/apps-yaml/#service-api) show the `service:` / `entity_id:` form. Each service entry also has `repeat: true` (start/freeze) or `repeat: false` (stop) on my system. Predbat's charge and discharge rates are written to `input_number.predbat_charge_rate` and `input_number.predbat_discharge_rate`, and the scripts read them from there. The reserve is written to `input_number.predbat_reserve`. Turn on `switch.predbat_set_export_freeze` if you want Freeze exporting.
 
 ## Entities the scripts use
 
